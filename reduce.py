@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from typing import Tuple
+
 
 class ReducedConv3d(nn.Module):
     def __init__(
@@ -237,3 +239,402 @@ class ReducedBatchNorm3d(nn.Module):
         # (N*D, C, H, W) -> (N, D, C, H, W) -> (N, C, D, H, W)
         out = bn_out.view(N, D, C, H, W).permute(0, 2, 1, 3, 4)
         return out
+
+
+def interpolate_3d(x: torch.Tensor, size: tuple | list) -> torch.Tensor:
+    """
+    Interpolates a 3D tensor to a new size using bilinear interpolation.
+
+    Args:
+        x (torch.Tensor): Input tensor of shape (N, C, D, H, W).
+        size (tuple | list): New size for the output tensor (D_out, H_out, W_out).
+
+    Returns:
+        torch.Tensor: Interpolated tensor of shape (N, C, D_out, H_out, W_out).
+    """
+    N, C, D, H, W = x.shape
+    if len(size) != 3:
+        raise ValueError("Size must be a tuple or list of length 3.")
+
+    raise NotImplementedError
+
+
+def bilinear_grid_sample(
+    im: torch.Tensor,
+    grid: torch.Tensor,
+    align_corners: bool = False,
+    padding_mode: str = "constant",
+) -> torch.Tensor:
+    """Given an input and a flow-field grid, computes the output using input
+    values and pixel locations from grid. Supported only bilinear interpolation
+    method to sample the input pixels.
+
+    Args:
+        im (torch.Tensor): Input feature map, shape (N, C, H, W)
+        grid (torch.Tensor): Point coordinates, shape (N, Hg, Wg, 2)
+        align_corners (bool): If set to True, the extrema (-1 and 1) are
+            considered as referring to the center points of the input's
+            corner pixels. If set to False, they are instead considered as
+            referring to the corner points of the input's corner pixels,
+            making the sampling more resolution agnostic.
+
+    Returns:
+        torch.Tensor: A tensor with sampled points, shape (N, C, Hg, Wg)
+    """
+    n, c, h, w = im.shape
+    gn, gh, gw, _ = grid.shape
+    assert n == gn
+
+    x = grid[:, :, :, 0]
+    y = grid[:, :, :, 1]
+
+    if align_corners:
+        x = ((x + 1) / 2) * (w - 1)
+        y = ((y + 1) / 2) * (h - 1)
+    else:
+        x = ((x + 1) * w - 1) / 2
+        y = ((y + 1) * h - 1) / 2
+
+    x = x.view(n, -1)
+    y = y.view(n, -1)
+
+    x0 = torch.floor(x).long()
+    y0 = torch.floor(y).long()
+    x1 = x0 + 1
+    y1 = y0 + 1
+
+    wa = ((x1 - x) * (y1 - y)).unsqueeze(1)
+    wb = ((x1 - x) * (y - y0)).unsqueeze(1)
+    wc = ((x - x0) * (y1 - y)).unsqueeze(1)
+    wd = ((x - x0) * (y - y0)).unsqueeze(1)
+
+    # Apply default for grid_sample function zero padding
+    im_padded = F.pad(im, pad=[1, 1, 1, 1], mode=padding_mode, value=0)
+    padded_h = h + 2
+    padded_w = w + 2
+    # save points positions after padding
+    x0, x1, y0, y1 = x0 + 1, x1 + 1, y0 + 1, y1 + 1
+
+    # Clip coordinates to padded image size
+    x0 = torch.where(x0 < 0, torch.tensor(0), x0)
+    x0 = torch.where(x0 > padded_w - 1, torch.tensor(padded_w - 1), x0)
+    x1 = torch.where(x1 < 0, torch.tensor(0), x1)
+    x1 = torch.where(x1 > padded_w - 1, torch.tensor(padded_w - 1), x1)
+    y0 = torch.where(y0 < 0, torch.tensor(0), y0)
+    y0 = torch.where(y0 > padded_h - 1, torch.tensor(padded_h - 1), y0)
+    y1 = torch.where(y1 < 0, torch.tensor(0), y1)
+    y1 = torch.where(y1 > padded_h - 1, torch.tensor(padded_h - 1), y1)
+
+    im_padded = im_padded.view(n, c, -1)
+
+    x0_y0 = (x0 + y0 * padded_w).unsqueeze(1).expand(-1, c, -1)
+    x0_y1 = (x0 + y1 * padded_w).unsqueeze(1).expand(-1, c, -1)
+    x1_y0 = (x1 + y0 * padded_w).unsqueeze(1).expand(-1, c, -1)
+    x1_y1 = (x1 + y1 * padded_w).unsqueeze(1).expand(-1, c, -1)
+
+    Ia = torch.gather(im_padded, 2, x0_y0)
+    Ib = torch.gather(im_padded, 2, x0_y1)
+    Ic = torch.gather(im_padded, 2, x1_y0)
+    Id = torch.gather(im_padded, 2, x1_y1)
+
+    return (Ia * wa + Ib * wb + Ic * wc + Id * wd).reshape(n, c, gh, gw)
+
+
+def bi_to_tri_v1(
+    x: torch.Tensor,
+    grid: torch.Tensor,
+    align_corners: bool = True,
+    padding_mode: str = "border",
+) -> torch.Tensor:
+    N, C, D_in, H_in, W_in = x.shape
+    _, D_out, H_out, W_out = grid.shape
+
+    xy_coords = grid[..., 0:2]
+    z_coords = grid[..., 2]
+
+    if align_corners:
+        z_denorm = (z_coords + 1) / 2 * (D_in - 1)
+    else:
+        z_denorm = ((z_coords + 1) / 2 * D_in) - 0.5
+
+    z_floor_idx = torch.floor(z_denorm)
+    z_ceil_idx = torch.ceil(z_denorm)
+
+    z_weights = z_denorm - z_floor_idx
+    z_weights = torch.clamp(z_weights, 0.0, 1.0)
+    z_weights = z_weights.unsqueeze(1)
+
+    z_floor_idx_clamped = torch.clamp(z_floor_idx.long(), 0, D_in - 1)
+    z_ceil_idx_clamped = torch.clamp(z_ceil_idx.long(), 0, D_in - 1)
+
+    K = D_out * H_out * W_out
+    batch_indices_for_gather = torch.arange(N, device=x.device).repeat_interleave(K)
+
+    z_floor_flat = z_floor_idx_clamped.reshape(N * K)
+    z_ceil_flat = z_ceil_idx_clamped.reshape(N * K)
+
+    slices_floor = x[batch_indices_for_gather, :, z_floor_flat, :, :]
+    slices_ceil = x[batch_indices_for_gather, :, z_ceil_flat, :, :]
+
+    xy_coords_for_gs = xy_coords.contiguous().view(N * K, 1, 1, 2)
+
+    interp_val_floor = F.grid_sample(
+        slices_floor,
+        xy_coords_for_gs,
+        mode="bilinear",
+        padding_mode=padding_mode,
+        align_corners=align_corners,
+    )
+    interp_val_ceil = F.grid_sample(
+        slices_ceil,
+        xy_coords_for_gs,
+        mode="bilinear",
+        padding_mode=padding_mode,
+        align_corners=align_corners,
+    )
+
+    interp_val_floor = interp_val_floor.view(N, D_out, H_out, W_out, C).permute(
+        0, 4, 1, 2, 3
+    )
+    interp_val_ceil = interp_val_ceil.view(N, D_out, H_out, W_out, C).permute(
+        0, 4, 1, 2, 3
+    )
+
+    output = (1.0 - z_weights) * interp_val_floor + z_weights * interp_val_ceil
+    return output
+
+
+# onnx export compatible version, for which opset version <= 11
+def bi_to_tri_v2(
+    x: torch.Tensor,
+    grid: torch.Tensor,
+    align_corners: bool = True,
+) -> torch.Tensor:
+
+    N, C, D_in, H_in, W_in = x.shape
+    _, D_out, H_out, W_out = grid.shape
+
+    xy_coords = grid[..., 0:2]
+    z_coords = grid[..., 2]
+
+    if align_corners:
+        z_denorm = (z_coords + 1) / 2 * (D_in - 1)
+    else:
+        z_denorm = ((z_coords + 1) / 2 * D_in) - 0.5
+
+    z_floor_idx = torch.floor(z_denorm)
+    z_ceil_idx = torch.ceil(z_denorm)
+
+    z_weights = z_denorm - z_floor_idx
+    z_weights = torch.clamp(z_weights, 0.0, 1.0)
+    z_weights = z_weights.unsqueeze(1)
+
+    z_floor_idx_clamped = torch.clamp(z_floor_idx.long(), 0, D_in - 1)
+    z_ceil_idx_clamped = torch.clamp(z_ceil_idx.long(), 0, D_in - 1)
+
+    K = D_out * H_out * W_out
+    batch_indices_for_gather = torch.arange(N, device=x.device).repeat_interleave(K)
+
+    z_floor_flat = z_floor_idx_clamped.reshape(N * K)
+    z_ceil_flat = z_ceil_idx_clamped.reshape(N * K)
+
+    slices_floor = x[batch_indices_for_gather, :, z_floor_flat, :, :]
+    slices_ceil = x[batch_indices_for_gather, :, z_ceil_flat, :, :]
+
+    xy_coords_for_gs = xy_coords.contiguous().view(N * K, 1, 1, 2)
+
+    interp_val_floor = bilinear_grid_sample(
+        slices_floor,
+        xy_coords_for_gs,
+        align_corners=align_corners,
+    )
+    interp_val_ceil = bilinear_grid_sample(
+        slices_ceil,
+        xy_coords_for_gs,
+        align_corners=align_corners,
+    )
+
+    interp_val_floor = interp_val_floor.view(N, D_out, H_out, W_out, C).permute(
+        0, 4, 1, 2, 3
+    )
+    interp_val_ceil = interp_val_ceil.view(N, D_out, H_out, W_out, C).permute(
+        0, 4, 1, 2, 3
+    )
+
+    output = (1.0 - z_weights) * interp_val_floor + z_weights * interp_val_ceil
+    return output
+
+
+def bi_to_tri(
+    x: torch.Tensor,
+    grid: torch.Tensor,
+    align_corners: bool = True,
+    export_compatible: bool = True,
+) -> torch.Tensor:
+    return (
+        bi_to_tri_v2(x, grid, align_corners)
+        if export_compatible
+        else bi_to_tri_v1(x, grid, align_corners)
+    )
+
+
+def _generate_grid(
+    output_size: Tuple[int, int, int],
+    align_corners: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Generates a uniform sampling grid for a given output size,
+    matching the conventions of F.interpolate.
+    Returns a grid of shape (D_out, H_out, W_out, 3).
+    """
+    D_out, H_out, W_out = output_size
+
+    if align_corners:
+        grid_z_1d = (
+            torch.linspace(-1.0, 1.0, D_out, device=device, dtype=dtype)
+            if D_out > 1
+            else torch.tensor([0.0], device=device, dtype=dtype)
+        )
+        grid_y_1d = (
+            torch.linspace(-1.0, 1.0, H_out, device=device, dtype=dtype)
+            if H_out > 1
+            else torch.tensor([0.0], device=device, dtype=dtype)
+        )
+        grid_x_1d = (
+            torch.linspace(-1.0, 1.0, W_out, device=device, dtype=dtype)
+            if W_out > 1
+            else torch.tensor([0.0], device=device, dtype=dtype)
+        )
+    else:
+        # Generates coordinates for pixel centers, scaled to [-1, 1]
+        # For Dim_out=1, coord is 0.5, normalized is 0.0
+        # For Dim_out=2, coords are 0.25, 0.75, normalized are -0.5, 0.5
+        grid_z_1d = (
+            (torch.arange(D_out, device=device, dtype=dtype) + 0.5) / D_out * 2.0 - 1.0
+            if D_out > 0
+            else torch.empty(0, device=device, dtype=dtype)
+        )
+        grid_y_1d = (
+            (torch.arange(H_out, device=device, dtype=dtype) + 0.5) / H_out * 2.0 - 1.0
+            if H_out > 0
+            else torch.empty(0, device=device, dtype=dtype)
+        )
+        grid_x_1d = (
+            (torch.arange(W_out, device=device, dtype=dtype) + 0.5) / W_out * 2.0 - 1.0
+            if W_out > 0
+            else torch.empty(0, device=device, dtype=dtype)
+        )
+
+        # Handle D_out/H_out/W_out = 1 case explicitly for arange logic to be consistent
+        if D_out == 1:
+            grid_z_1d = torch.tensor([0.0], device=device, dtype=dtype)
+        if H_out == 1:
+            grid_y_1d = torch.tensor([0.0], device=device, dtype=dtype)
+        if W_out == 1:
+            grid_x_1d = torch.tensor([0.0], device=device, dtype=dtype)
+
+    mesh_z, mesh_y, mesh_x = torch.meshgrid(
+        grid_z_1d, grid_y_1d, grid_x_1d, indexing="ij"
+    )
+    # Stack in (x, y, z) order for grid_sample compatibility
+    grid = torch.stack((mesh_x, mesh_y, mesh_z), dim=-1)
+    return grid
+
+
+def interpolate_3d(
+    x: torch.Tensor,
+    size: tuple,
+    align_corners: bool = True,
+    export_compatible: bool = True,
+) -> torch.Tensor:
+    """
+    Resizes a 3D volume using mimicked trilinear interpolation (based on bilinear ops).
+    This function generates an implicit grid similar to F.interpolate.
+
+    Args:
+        volume (torch.Tensor): The input 3D volume of shape (N, C, D_in, H_in, W_in).
+        output_size (Tuple[int, int, int]): The target output spatial size (D_out, H_out, W_out).
+        align_corners (bool): Argument for grid generation and for the underlying F.grid_sample calls.
+
+    Returns:
+        torch.Tensor: The resized output of shape (N, C, D_out, H_out, W_out).
+    """
+    N, C, _, _, _ = x.shape  # D_in, H_in, W_in not directly used for grid gen here
+    device = x.device
+    dtype = x.dtype  # Generate grid with same dtype as volume's float components
+
+    if not (isinstance(size, tuple) and len(size) == 3):
+        raise ValueError(
+            "output_size must be a tuple of 3 integers (D_out, H_out, W_out)"
+        )
+    if not all(isinstance(s, int) and s > 0 for s in size):
+        raise ValueError("All dimensions in output_size must be positive integers.")
+
+    # Generate the implicit uniform grid
+    # base_grid has shape (D_out, H_out, W_out, 3)
+    base_grid = _generate_grid(size, align_corners, device, dtype)
+
+    # Expand grid for batch N. Use .expand() to avoid data copy.
+    # Target shape for grid_for_mimic: (N, D_out, H_out, W_out, 3)
+    grid_for_mimic = base_grid.unsqueeze(0).expand(N, -1, -1, -1, -1)
+
+    return bi_to_tri(x, grid_for_mimic, align_corners, export_compatible)
+
+
+def interpolate_3d_seq(
+    x: torch.Tensor,
+    new_size: Tuple[int, int, int],
+    align_corners: bool = False,
+) -> torch.Tensor:
+    """
+    Resizes a 3D tensor using sequential bilinear interpolations.
+    This is a separable interpolation approach, NOT true trilinear interpolation.
+    Args:
+        x: Input tensor of shape (N, C, D, H, W).
+        new_size: Target size (new_D, new_H, new_W).
+        align_corners: Passed to F.interpolate.
+    Returns:
+        Interpolated tensor of shape (N, C, new_D, new_H, new_W).
+    """
+    N, C, D, H, W = x.shape
+    new_D, new_H, new_W = new_size
+
+    # Step 1: Interpolate (H, W) using bilinear for each D-slice
+    # Reshape so that each (D) slice is treated as a batch item for 2D interpolation
+    x_hw_interp = x.reshape(N * C * D, 1, H, W)
+    x_hw_interp = F.interpolate(
+        x_hw_interp, size=(new_H, new_W), mode="bilinear", align_corners=align_corners
+    )
+    x_hw_interp = x_hw_interp.reshape(N, C, D, new_H, new_W)
+    # Now shape is (N, C, D, new_H, new_W)
+
+    # Step 2: Interpolate D to new_D.
+    # We can do this by permuting D to be one of the last two dimensions for F.interpolate.
+    # For example, interpolate along D and new_W (which is already at its target size).
+    # This effectively becomes a 1D linear interpolation along the D-axis for each (N, C, new_H, w_idx) "vector".
+
+    # Permute to (N, C, new_H, new_W, D) to make D the last dimension
+    x_d_permuted = x_hw_interp.permute(0, 1, 3, 4, 2)
+    # Reshape for F.interpolate (treating new_H*new_W as batch, D as length)
+    # Each (n,c,h,w) element has a D-length vector to be interpolated.
+    x_d_reshaped = x_d_permuted.reshape(
+        N * C * new_H * new_W, 1, D
+    )  # Shape for 1D interpolation (N_eff, Channels, Length)
+
+    # Interpolate along the D dimension (now the last dimension of the reshaped tensor)
+    # For 1D interpolation, F.interpolate expects 3D input (N, C, L) or 2D input (N,L)
+    # mode 'linear' is for 1D data.
+    x_d_interpolated = F.interpolate(
+        x_d_reshaped, size=(new_D,), mode="linear", align_corners=align_corners
+    )
+    # Output shape: (N*C*new_H*new_W, 1, new_D)
+
+    # Reshape back to desired intermediate order
+    x_final_reshaped = x_d_interpolated.reshape(N, C, new_H, new_W, new_D)
+
+    # Permute to final target shape (N, C, new_D, new_H, new_W)
+    output = x_final_reshaped.permute(0, 1, 4, 2, 3)
+
+    return output
